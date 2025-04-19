@@ -1,0 +1,4 @@
+.ipynb_checkpoints
+.nfs*
+wandb
+__pycache__

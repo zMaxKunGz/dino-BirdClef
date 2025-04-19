@@ -14,7 +14,7 @@
 import argparse
 import os
 import sys
-import datetime
+from datetime import datetime, timedelta
 import time
 import math
 import json
@@ -27,12 +27,15 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+import wandb
+import pandas as pd
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -119,6 +122,8 @@ def get_args_parser():
     # Misc
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--csv_path', default='/path/to/imagenet/train/', type=str,
+        help='Please specify path to the CSV training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -128,12 +133,47 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
+class CustomDataset(Dataset):
+    def __init__(self, dataframe, root_path, transform=None, args=None):
+        """
+        Args:
+            dataframe (pd.DataFrame): DataFrame with 'samplename' column.
+            root_path (str): Path where the images are stored.
+        """
+        self.dataframe = dataframe
+        self.root_path = root_path
+        self.args = args
+
+    def __len__(self):
+        """Returns the total number of samples in the dataset"""
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        """Fetches the sample by index"""
+        # Get the sample name (file) from the dataframe
+        samplename = self.dataframe.iloc[idx]['samplename']
+        
+        # Construct the full file path
+        file_path = os.path.join(self.root_path, samplename)
+
+        data = np.load(file_path)
+
+        # Convert NumPy array to PyTorch tensor
+        if self.args.use_fp16:
+            data_tensor = torch.tensor(data, dtype=torch.float16)
+        else:
+            data_tensor = torch.tensor(data, dtype=torch.float32)
+
+        return data_tensor
 
 def train_dino(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
+    rank = int(os.environ['RANK'])
+    if rank == 0:
+        setup_wandb(run_name='birdclef' + datetime.now().strftime("%d-%m-%Y:%H-%M"), config=args)
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
@@ -142,7 +182,9 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    df = pd.read_csv(args.csv_path)
+    dataset = CustomDataset(dataframe=df, root_path=args.data_path, transform=transform)
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -294,7 +336,7 @@ def train_dino(args):
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
     total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    total_time_str = str(timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
 
@@ -320,6 +362,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
+            if int(os.environ['RANK']) == 0:
+                wandb.log({'loss': loss.item()})
             print("Loss is {}, stopping training".format(loss.item()), force=True)
             sys.exit(1)
 
@@ -463,6 +507,20 @@ class DataAugmentationDINO(object):
             crops.append(self.local_transfo(image))
         return crops
 
+
+def setup_wandb(project_name:str="Birdclef",
+                run_name:str=None,
+                config=None):
+    """
+    Initialize WandB for logging.
+    Each process logs separately but syncs to a single project.
+    """
+    # Initialize WandB only for rank 0 (primary logger)
+    wandb.init(
+        project=project_name,
+        name=run_name if run_name else f"Run-{os.getpid()}",
+        config=config,
+    )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
