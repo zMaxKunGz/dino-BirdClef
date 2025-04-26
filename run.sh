@@ -4,4 +4,5 @@ torchrun --nproc_per_node=2 ./main_dino.py \
     --local_crops_number 0 \
     --epoch 10 \
     --warmup_epochs 5 \
-    --arch efficientnet_b0
+    --arch efficientnet_b0 \
+    --output_dir pretrain_output

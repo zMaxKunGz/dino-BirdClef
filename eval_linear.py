@@ -20,13 +20,45 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+from torch.utils.data import Dataset
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
 
+import pandas as pd
 import utils
 import vision_transformer as vits
+import numpy as np
 
+class CustomDataset(Dataset):
+    def __init__(self, dataframe, root_path, transform=None, args=None, idx_map=None):
+        """
+        Args:
+            dataframe (pd.DataFrame): DataFrame with 'samplename' column.
+            root_path (str): Path where the images are stored.
+        """
+        self.dataframe = dataframe
+        self.root_path = root_path
+        self.args = args
+        self.idx_map = idx_map
+    def __len__(self):
+        """Returns the total number of samples in the dataset"""
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        """Fetches the sample by index"""
+        # Get the sample name (file) from the dataframe
+        samplename = self.dataframe.iloc[idx]['samplename']
+        label = self.dataframe.iloc[idx]['primary_label']
+        # Construct the full file path
+        file_path = os.path.join(self.root_path, samplename)
+
+        data = np.load(file_path)
+        data_tensor = torch.tensor(data)
+        target = torch.zeros(self.args.num_labels)
+        target[self.idx_map[label]] = 1
+        data_tensor = data_tensor[None, ...]
+        return data_tensor, target
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
@@ -46,8 +78,13 @@ def eval_linear(args):
     # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
         model = torchvision_models.__dict__[args.arch]()
-        embed_dim = model.fc.weight.shape[1]
-        model.fc = nn.Identity()
+        embed_dim = model.classifier[1].weight.shape[1]
+        model.classifier = nn.Identity()
+        model = nn.Sequential(
+            nn.Conv2d(1, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
+            model
+        )
+        print(model)
     else:
         print(f"Unknow architecture: {args.arch}")
         sys.exit(1)
@@ -68,7 +105,12 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+    df_val = pd.read_csv(args.eval_path)
+    df_train = pd.read_csv(args.csv_path)
+    df_label = pd.read_csv(args.label_path)
+    labels = df_label['primary_label'].unique()
+    label_idx_map = {label: idx for idx, label in enumerate(labels)}
+    dataset_val = CustomDataset(dataframe=df_val, root_path=args.data_path, transform=val_transform, args=args, idx_map=label_idx_map)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -88,7 +130,8 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    dataset_train = CustomDataset(dataframe=df_train, root_path=args.data_path, transform=train_transform, args=args, idx_map=label_idx_map)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -216,6 +259,8 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         loss = nn.CrossEntropyLoss()(output, target)
 
         if linear_classifier.module.num_labels >= 5:
+            print(output.shape)
+            print(target.shape)
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         else:
             acc1, = utils.accuracy(output, target, topk=(1,))
@@ -277,5 +322,8 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
     parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+    parser.add_argument('--csv_path', default='/path/to/imagenet/train/', type=str, help='Please specify path to the CSV training data.')
+    parser.add_argument('--eval_path', default='/path/to/imagenet/val/', type=str, help='Please specify path to the CSV val data.')
+    parser.add_argument('--label_path', default='/path/to/imagenet/val/', type=str, help='Please specify path to the CSV val data.')
     args = parser.parse_args()
     eval_linear(args)

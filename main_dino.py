@@ -159,13 +159,11 @@ class CustomDataset(Dataset):
         data = np.load(file_path)
 
         # Convert NumPy array to PyTorch tensor
-        # if self.args.use_fp16:
-        #     data_tensor = torch.tensor(data, dtype=torch.float16)
-        # else:
-        #     data_tensor = torch.tensor(data, dtype=torch.float32).
-        data_tensor = torch.tensor(data, dtype=torch.float32)
+        if self.args.use_fp16:
+            data_tensor = torch.tensor(data, dtype=torch.float16)
+        else:
+            data_tensor = torch.tensor(data, dtype=torch.float32)
         data_tensor = data_tensor[None, ...]
-        # data_tensor = data_tensor.expand((3, -1, -1))
         return data_tensor
 
 def train_dino(args):
@@ -185,7 +183,7 @@ def train_dino(args):
         args.local_crops_number,
     )
     df = pd.read_csv(args.csv_path)
-    dataset = CustomDataset(dataframe=df, root_path=args.data_path, transform=transform)
+    dataset = CustomDataset(dataframe=df, root_path=args.data_path, transform=transform, args=args)
     # dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
