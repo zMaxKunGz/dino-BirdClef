@@ -159,11 +159,13 @@ class CustomDataset(Dataset):
         data = np.load(file_path)
 
         # Convert NumPy array to PyTorch tensor
-        if self.args.use_fp16:
-            data_tensor = torch.tensor(data, dtype=torch.float16)
-        else:
-            data_tensor = torch.tensor(data, dtype=torch.float32)
-
+        # if self.args.use_fp16:
+        #     data_tensor = torch.tensor(data, dtype=torch.float16)
+        # else:
+        #     data_tensor = torch.tensor(data, dtype=torch.float32).
+        data_tensor = torch.tensor(data, dtype=torch.float32)
+        data_tensor = data_tensor[None, ...]
+        # data_tensor = data_tensor.expand((3, -1, -1))
         return data_tensor
 
 def train_dino(args):
@@ -217,11 +219,19 @@ def train_dino(args):
     elif args.arch in torchvision_models.__dict__.keys():
         student = torchvision_models.__dict__[args.arch]()
         teacher = torchvision_models.__dict__[args.arch]()
-        embed_dim = student.fc.weight.shape[1]
+        embed_dim = student.classifier[1].weight.shape[0]
     else:
         print(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
+    student = nn.Sequential(
+        nn.Conv2d(1, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
+        student
+    )
+    teacher = nn.Sequential(
+        nn.Conv2d(1, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
+        teacher
+    )
     student = utils.MultiCropWrapper(student, DINOHead(
         embed_dim,
         args.out_dim,
@@ -274,7 +284,7 @@ def train_dino(args):
     # for mixed precision training
     fp16_scaler = None
     if args.use_fp16:
-        fp16_scaler = torch.cuda.amp.GradScaler()
+        fp16_scaler = torch.amp.GradScaler('cuda')
 
     # ============ init schedulers ... ============
     lr_schedule = utils.cosine_scheduler(
@@ -329,6 +339,7 @@ def train_dino(args):
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
         utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
+            
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
@@ -345,7 +356,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, images in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -354,16 +365,17 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
-        images = [im.cuda(non_blocking=True) for im in images]
+        # images = torch.Tensor([im.cuda(non_blocking=True) for im in images])
+        images = images.cuda(non_blocking=True)
         # teacher and student forward passes + compute dino loss
-        with torch.cuda.amp.autocast(fp16_scaler is not None):
+        with torch.amp.autocast('cuda', dtype=torch.float32):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_output = student(images)
             loss = dino_loss(student_output, teacher_output, epoch)
+            if int(os.environ['RANK']) == 0:
+                wandb.log({'loss': loss.item(), 'learning rate': param_groups[0]["lr"]})
 
         if not math.isfinite(loss.item()):
-            if int(os.environ['RANK']) == 0:
-                wandb.log({'loss': loss.item()})
             print("Loss is {}, stopping training".format(loss.item()), force=True)
             sys.exit(1)
 
