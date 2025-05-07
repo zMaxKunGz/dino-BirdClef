@@ -74,7 +74,7 @@ def get_args_parser():
     parser.add_argument('--teacher_temp', default=0.04, type=float, help="""Final value (after linear warmup)
         of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
         starting with the default value of 0.04 and increase this slightly if needed.""")
-    parser.add_argument('--warmup_teacher_temp_epochs', default=0, type=int,
+    parser.add_argument('--warmup_teacher_temp_epochs', default=10, type=int,
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
@@ -143,6 +143,7 @@ class CustomDataset(Dataset):
         self.dataframe = dataframe
         self.root_path = root_path
         self.args = args
+        self.transform = transform
 
     def __len__(self):
         """Returns the total number of samples in the dataset"""
@@ -156,15 +157,17 @@ class CustomDataset(Dataset):
         # Construct the full file path
         file_path = os.path.join(self.root_path, samplename)
 
-        data = np.load(file_path)
-
+        data = np.load(file_path)*255
+        image = Image.fromarray(data)
+        image = image.convert('RGB')
+        data = self.transform(image)
         # Convert NumPy array to PyTorch tensor
-        if self.args.use_fp16:
-            data_tensor = torch.tensor(data, dtype=torch.float16)
-        else:
-            data_tensor = torch.tensor(data, dtype=torch.float32)
-        data_tensor = data_tensor[None, ...]
-        return data_tensor
+        # if self.args.use_fp16:
+        #     data_tensor = data.to(torch.float16)
+        # else:
+            # data_tensor = data.to(torch.float32)
+        # data_tensor = data_tensor[None, ...]
+        return data
 
 def train_dino(args):
     utils.init_distributed_mode(args)
@@ -222,14 +225,6 @@ def train_dino(args):
         print(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
-    student = nn.Sequential(
-        nn.Conv2d(1, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
-        student
-    )
-    teacher = nn.Sequential(
-        nn.Conv2d(1, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
-        teacher
-    )
     student = utils.MultiCropWrapper(student, DINOHead(
         embed_dim,
         args.out_dim,
@@ -363,15 +358,14 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
-        # images = torch.Tensor([im.cuda(non_blocking=True) for im in images])
-        images = images.cuda(non_blocking=True)
+        images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.amp.autocast('cuda', dtype=torch.float32):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_output = student(images)
             loss = dino_loss(student_output, teacher_output, epoch)
             if int(os.environ['RANK']) == 0:
-                wandb.log({'loss': loss.item(), 'learning rate': param_groups[0]["lr"]})
+                wandb.log({'loss': loss.item()})
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
