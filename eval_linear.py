@@ -39,6 +39,7 @@ class CustomDataset(Dataset):
         """
         self.dataframe = dataframe
         self.root_path = root_path
+        self.transform = transform
         self.args = args
         self.idx_map = idx_map
     def __len__(self):
@@ -53,12 +54,14 @@ class CustomDataset(Dataset):
         # Construct the full file path
         file_path = os.path.join(self.root_path, samplename)
 
-        data = np.load(file_path)
-        data_tensor = torch.tensor(data)
-        target = torch.zeros(self.args.num_labels)
-        target[self.idx_map[label]] = 1
+        data = np.load(file_path)*255
+        image = Image.fromarray(data)
+        image = image.convert('RGB')
+        data = self.transform(image)
+        
+        target = self.idx_map[label]
         data_tensor = data_tensor[None, ...]
-        return data_tensor, target
+        return data, target
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
@@ -84,7 +87,6 @@ def eval_linear(args):
             nn.Conv2d(1, 3, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),
             model
         )
-        print(model)
     else:
         print(f"Unknow architecture: {args.arch}")
         sys.exit(1)
@@ -146,7 +148,7 @@ def eval_linear(args):
     optimizer = torch.optim.SGD(
         linear_classifier.parameters(),
         args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
-        momentum=0.9,
+        momentum=0.9,  
         weight_decay=0, # we do not apply weight decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
@@ -259,8 +261,6 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
         loss = nn.CrossEntropyLoss()(output, target)
 
         if linear_classifier.module.num_labels >= 5:
-            print(output.shape)
-            print(target.shape)
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         else:
             acc1, = utils.accuracy(output, target, topk=(1,))
